@@ -1,0 +1,7 @@
+# 凭证与机器本地文件，绝不入库
+wb-key-payload.json
+capture/
+*.log
+*.pid
+*.bak*
+__pycache__/
