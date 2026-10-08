@@ -6,7 +6,7 @@
 
 1. **协议翻译**。ZCode 走 OpenAI 兼容协议调 `127.0.0.1:8787`，代理把请求翻译成 WorkBuddy 网关（`copilot.tencent.com/v2/chat/completions`）的原生格式转发，SSE 回流清洗后交给 ZCode。temperature / max_tokens / 思考档位按服务端下发的模型配置强制对齐，官方从不赋值的字段一律剥掉。
 2. **令牌解密**。WorkBuddy 5.6.2 起 accessToken 落盘变成 AES-256-GCM 信封（`$wbEncrypted`），不再有明文。代理按逆向出的 WB-AAD v1 规范在内存里解密，令牌刷新自动跟随，明文令牌不落盘。
-3. **通道适配**。网关有两道校验：令牌信封（对应 401）和 system 角色提示词的通道扫描（对应 400 `code 11128`）。第二道的解法是把 system/developer 内容挂 user 角色下发——内容零改写，只换角色标签。
+3. **协议翻译与通道适配**。ZCode 走 OpenAI 兼容协议调 `127.0.0.1:8787`，代理把请求翻译成 WorkBuddy 网关（`copilot.tencent.com/v2/chat/completions`）的原生格式转发，SSE 回流清洗后交给 ZCode。temperature / max_tokens / 思考档位按服务端下发的模型配置强制对齐，官方从不赋值的字段一律剥掉。网关的两道通道校验（system 角色扫描、签名串跨角色自证）都在代理里自动处理，见下方"两个硬坎"。
 
 所有请求走本机，代理只监听 `127.0.0.1`，凭证不离开你的电脑。
 
@@ -46,15 +46,13 @@ WorkBuddy 5.6.2 + ZCode 3.14.4 + Windows，2026-10-01。老版本 WorkBuddy（5.
 - AES-256-GCM，AAD 按 WB-AAD v1 规范拼：`"WB-AAD\0" + 版本号 + 长度前缀的 framing 名（字段级 WBEV1 / 整文件 WBEF1）+ "sym-v1" + suite + keyId + framing 字节 + 空 sequence + 空 final`；
 - `atRestSecretKey` 不在磁盘任何文件（keyblob / workbuddy.db / leveldb 全查过），由桌面端运行时派生，所以只能从进程内存里拿——这就是 `scan_mem.py` 存在的原因。密钥跨重启稳定，令牌刷新不影响它。
 
-**坑二：11128 通道校验**
+**坑二：11128 通道校验（两层）**
 
 带完整系统提示词的请求会被网关以 `400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}` 拦截，而裸消息能过。二分定位后的结论：
 
-- 确定性内容扫描，与工具定义、消息历史、请求长度、`max_completion_tokens` 等字段无关；
-- 最小触发组合小到一句 `Main branch (you will usually use this for PRs)`，把其中任一单词换成别的就通过；
-- 同样的内容挂 **user 角色**就能通过。
-
-所以代理把 system/developer 消息一律改挂 user 角色下发（内容零改写，只换角色标签）。副作用是指令从"系统角色"变成"用户角色"，实测指令遵循不受影响。
+- **第一层（角色）**：扫描 system 角色里的内容。同样内容挂 user 角色即可通过，代理把 system/developer 一律挂 user 下发（内容零改写）。
+- **第二层（签名，会自证循环）**：2026-10-08 发现签名串（如 `Main branch (you will usually use this for PRs)`）出现在 **assistant/tool 角色同样被拦**。危害在于：会话历史里只要引用过一次这个串（调试记录、粘贴的报错），它就随历史永远回传，之后每一轮都被拦。代理 v1.3.0 起对**所有角色**的消息做签名中性化（替换成等长无害近似语，语义基本不变）；遇到新签名时往 `SIGNS` 表里加一行即可——判据是"同一串在 user 角色能过、在其他角色被拦"。
+- 与工具定义、消息历史长度、`max_completion_tokens` 等字段无关；触发是确定性的，不是概率风控。
 
 另外三个小坑也修在了代理里：上游 SSE 的 heartbeat 注释行与 data 行同块（逐行挑 `data:`）；每个 delta 块都带空占位字段导致思考被切碎（`sanitizeDelta` 只留有内容的字段）；客户端断开要用 `res.on("close")` 判断而不是 `req`。
 

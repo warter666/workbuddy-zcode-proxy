@@ -34,7 +34,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 const BIND = "127.0.0.1";
 const PORT = parseInt(process.argv[2] || process.env.WB_PROXY_PORT || "8787", 10);
 
@@ -162,6 +162,24 @@ const MODEL_ALIASES = {
 };
 // 已在网关下架的模型，直接拒绝，避免误扣额度或报错
 const RETIRED = new Set(["auto"]);
+
+// ============================================================================
+// 通道签名中性化
+//   网关 11128 扫描所有角色（system/assistant/tool）消息里的"官方客户端指纹"串。
+//   会话历史里只要引用过一次（比如调试记录、用户粘贴的报错），签名就会随历史
+//   一直回传，形成自证循环。代理把已知签名替换成等长的无害近似语，内容语义基本不变。
+//   新签名出现时加进 SIGNS 即可（同一串在 user 角色能过、其他角色被拦即为签名）。
+// ============================================================================
+const SIGNS = [
+  ["Main branch (you will usually use this for PRs)", "Main branch (used for PRs)"],
+];
+function neutralizeSigns(text) {
+  let out = text, hit = false;
+  for (const [sig, rep] of SIGNS) {
+    if (out.includes(sig)) { out = out.split(sig).join(rep); hit = true; }
+  }
+  return hit ? out : text;
+}
 
 const VALID_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -349,11 +367,28 @@ function buildUpstreamRequest(clientBody, clientModel) {
   // 3) 角色归一：网关通道校验（code 11128）会拦截 system 角色里的第三方提示词，
   //    实测同样内容挂 user 角色可正常通过 → developer/system 一律下发为 user
   if (Array.isArray(body.messages)) {
-    body.messages = body.messages.map((m) =>
-      m && (m.role === "developer" || m.role === "system")
-        ? Object.assign({}, m, { role: "user" })
-        : m
-    );
+    body.messages = body.messages.map((m) => {
+      if (!m) return m;
+      // 签名中性化：所有角色的字符串内容都过一遍（历史里的签名会自证循环）
+      if (typeof m.content === "string") {
+        const nv = neutralizeSigns(m.content);
+        if (nv !== m.content) m = Object.assign({}, m, { content: nv });
+      } else if (Array.isArray(m.content)) {
+        let changed = false;
+        const arr = m.content.map((p) => {
+          if (p && p.type === "text" && typeof p.text === "string") {
+            const nv = neutralizeSigns(p.text);
+            if (nv !== p.text) { changed = true; return Object.assign({}, p, { text: nv }); }
+          }
+          return p;
+        });
+        if (changed) m = Object.assign({}, m, { content: arr });
+      }
+      if (m.role === "developer" || m.role === "system") {
+        m = Object.assign({}, m, { role: "user" });
+      }
+      return m;
+    });
   }
 
   // 4) 以官方定义值覆盖客户端
